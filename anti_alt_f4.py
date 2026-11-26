@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import font as tkfont
 
 # ---------------------------------------------------------------------------
 # Реплики (из README, 1..9; 10-я — скример — пока не используем)
@@ -31,6 +32,15 @@ REPLIKAS = [
 
 APP_NAME = "Anti Alt+F4"
 MAX_ATTEMPTS = len(REPLIKAS)
+
+# --- оформление попапа ------------------------------------------------------
+BG = "#1a1a1a"
+FG = "#f5f5f5"
+ACCENT = "#dc2626"
+PADX, PADY = 34, 26
+MAX_TEXT_W = 560          # максимальная ширина текста в пикселях
+MIN_POPUP_W, MAX_POPUP_W = 380, 660
+MIN_POPUP_H = 200
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +284,7 @@ class AntiAltF4App:
         self.popup_text = None
         self.popup_counter = None
 
+        self.sound_enabled = True
         self.hook = AltF4Hook(on_alt_f4=self._on_alt_f4_from_hook)
         self.tray_icon = None
         self._exiting = False
@@ -293,7 +304,6 @@ class AntiAltF4App:
 
     # -- окно по центру ------------------------------------------------------
     def _center_window(self, win, width, height):
-        win.update_idletasks()
         try:
             sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         except Exception:
@@ -302,14 +312,71 @@ class AntiAltF4App:
         y = max(0, (sh - height) // 2)
         win.geometry(f"{width}x{height}+{x}+{y}")
 
+    @staticmethod
+    def _wrap_text(text, font, max_width):
+        """Свой перенос строк: считаем реальную ширину в пикселях."""
+        lines = []
+        for paragraph in text.split("\n"):
+            words = paragraph.split()
+            if not words:
+                lines.append("")
+                continue
+            cur = words[0]
+            for word in words[1:]:
+                trial = f"{cur} {word}"
+                if font.measure(trial) <= max_width:
+                    cur = trial
+                else:
+                    lines.append(cur)
+                    cur = word
+            lines.append(cur)
+        return "\n".join(lines)
+
+    def _play_sound(self, n):
+        """Звук при появлении окна: чем больше попыток, тем злее."""
+        if not self.sound_enabled:
+            return
+        try:
+            import winsound
+        except Exception:
+            return
+
+        def _worker():
+            try:
+                if n <= 0:
+                    alias, times = "SystemAsterisk", 1
+                elif n <= 3:
+                    alias, times = "SystemExclamation", 1
+                elif n <= 6:
+                    alias, times = "SystemHand", 1
+                else:
+                    alias, times = "SystemHand", 2
+                for _ in range(times):
+                    try:
+                        winsound.PlaySound(
+                            alias,
+                            winsound.SND_ALIAS
+                            | winsound.SND_ASYNC
+                            | winsound.SND_NODEFAULT,
+                        )
+                    except Exception:
+                        winsound.MessageBeep(winsound.MB_ICONHAND)
+                    if times > 1:
+                        time.sleep(0.35)
+            except Exception as e:
+                _log(f"sound error: {e}")
+
+        threading.Thread(target=_worker, daemon=True, name="sound").start()
+
     def _show_popup(self, text, n):
-        # если окно уже открыто — просто обновить текст и поднять наверх
+        # если окно уже открыто — обновить текст/размер и поднять наверх
         if self.popup is not None and self.popup.winfo_exists():
-            self.popup_text.config(text=text)
-            self.popup_counter.config(text=f"Попытка {n} из {MAX_ATTEMPTS}")
+            self._fill_popup(text, n)
+            self.popup.deiconify()
             self.popup.lift()
             self.popup.focus_force()
             self._shake(self.popup)
+            self._play_sound(n)
             return
 
         win = tk.Toplevel(self.root)
@@ -317,57 +384,96 @@ class AntiAltF4App:
         win.title(APP_NAME)
         win.resizable(False, False)
         win.attributes("-topmost", True)
-        try:
-            win.attributes("-toolwindow", False)
-        except Exception:
-            pass
+        win.configure(bg=BG)
 
-        bg = "#1a1a1a"
-        fg = "#f5f5f5"
-        accent = "#dc2626"
-        win.configure(bg=bg)
+        # контейнер: всё содержимое внутри, окно потом подгоняется по нему
+        wrap = tk.Frame(win, bg=BG, padx=int(PADX), pady=int(PADY))
+        wrap.pack(fill="both", expand=True)
+        self.popup_body = wrap
 
-        width, height = 460, 240
-        self._center_window(win, width, height)
-        win.geometry(f"{width}x{height}")
+        self.popup_header = tk.Label(
+            wrap, text="", bg=BG, fg=ACCENT, font=("Segoe UI", 12, "bold"),
+        )
+        self.popup_header.pack(pady=(0, 10))
 
-        # заголовок
-        header = tk.Label(win, text="⛔  Alt+F4 заблокирован", bg=bg, fg=accent,
-                          font=("Segoe UI", 11, "bold"))
-        header.pack(pady=(16, 4))
+        self.popup_text = tk.Label(
+            wrap, text="", bg=BG, fg=FG, font=self._combo_font(),
+            justify="center", anchor="center",
+        )
+        self.popup_text.pack()
 
-        # реплика
-        self.popup_text = tk.Label(win, text=text, bg=bg, fg=fg,
-                                   font=("Segoe UI", 16, "bold"),
-                                   wraplength=420, justify="center")
-        self.popup_text.pack(pady=(8, 4), padx=20)
+        self.popup_counter = tk.Label(
+            wrap, text="", bg=BG, fg="#9ca3af", font=("Segoe UI", 10),
+        )
+        self.popup_counter.pack(pady=(10, 12))
 
-        # счётчик
-        self.popup_counter = tk.Label(win, text=f"Попытка {n} из {MAX_ATTEMPTS}",
-                                      bg=bg, fg="#9ca3af", font=("Segoe UI", 10))
-        self.popup_counter.pack(pady=(2, 8))
-
-        # кнопка
-        btn = tk.Button(win, text="Понял", command=self._close_popup,
-                        bg=accent, fg="white", activebackground="#b91c1c",
-                        activeforeground="white", font=("Segoe UI", 11, "bold"),
-                        width=14, pady=4, relief="flat", cursor="hand2")
-        btn.pack(pady=(4, 16))
+        btn = tk.Button(
+            wrap, text="Понял", command=self._close_popup,
+            bg=ACCENT, fg="white", activebackground="#b91c1c",
+            activeforeground="white", font=("Segoe UI", 11, "bold"),
+            width=16, pady=5, relief="flat", cursor="hand2",
+            bd=0, highlightthickness=0,
+        )
+        btn.pack()
         btn.focus_set()
         win.bind("<Return>", lambda e: self._close_popup())
         win.bind("<Escape>", lambda e: self._close_popup())
+        win.bind("<Alt-F4>", lambda e: self._close_popup())
 
         # закрытие крестиком — просто спрятать окно, приложение живёт в трее
         win.protocol("WM_DELETE_WINDOW", self._close_popup)
+
+        self._fill_popup(text, n)
         win.lift()
         win.focus_force()
         self._shake(win)
+        self._play_sound(n)
+
+    def _combo_font(self, size=17):
+        return ("Segoe UI", size, "bold")
+
+    def _fill_popup(self, text, n):
+        """Обновить текст и подогнать окно под содержимое (ничего не срезается)."""
+        win = self.popup
+        if win is None:
+            return
+        # подбираем размер шрифта, чтобы длинные реплики влезали
+        box_w = MAX_TEXT_W
+        size = 17
+        wrapped = ""
+        while size >= 11:
+            font = tkfont.Font(family="Segoe UI", size=size, weight="bold")
+            wrapped = self._wrap_text(text, font, box_w)
+            lines = wrapped.count("\n") + 1
+            if lines <= 5:
+                break
+            size -= 1
+        self.popup_text.config(text=wrapped, font=("Segoe UI", size, "bold"))
+        self.popup_header.config(
+            text="Alt+F4 заблокирован" if n > 0 else "Anti Alt+F4 активен"
+        )
+        self.popup_counter.config(
+            text=f"Попытка {n} из {MAX_ATTEMPTS}" if n > 0 else "Жми Alt+F4"
+        )
+
+        # окно = запрошенный размер содержимого (ничего не срезается)
+        win.update_idletasks()
+        w = max(MIN_POPUP_W, min(MAX_POPUP_W, self.popup_body.winfo_reqwidth()))
+        h = max(MIN_POPUP_H, self.popup_body.winfo_reqheight())
+        # страховка: не вылезать за пределы экрана
+        try:
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            w = min(w, int(sw * 0.9))
+            h = min(h, int(sh * 0.9))
+        except Exception:
+            pass
+        self._center_window(win, w, h)
+        _log(f"попап: {w}x{h}, шрифт {size}, строк {wrapped.count(chr(10)) + 1}")
 
     def _shake(self, win):
         """Лёгкая тряска окна для эффекта."""
         try:
             geo = win.geometry()
-            # geo вида WxH+X+Y
             wh, xy = geo.split("+", 1)
             w, h = wh.split("x")
             x, y = int(xy.split("+")[0]), int(xy.split("+")[1])
@@ -375,13 +481,18 @@ class AntiAltF4App:
             return
 
         def step(i, dx):
-            if i > 6 or not win.winfo_exists():
-                win.geometry(f"{w}x{h}+{x}+{y}")
-                return
-            win.geometry(f"{w}x{h}+{x + dx}+{y}")
-            win.after(30, lambda: step(i + 1, -dx if dx else 6))
+            try:
+                if not win.winfo_exists():
+                    return
+                if i > 6:
+                    win.geometry(f"{w}x{h}+{x}+{y}")
+                    return
+                win.geometry(f"{w}x{h}+{x + dx}+{y}")
+                win.after(30, lambda: step(i + 1, -dx if dx else 6))
+            except Exception:
+                pass
 
-        win.after(30, lambda: step(0, 6))
+        win.after(60, lambda: step(0, 7))
 
     def _close_popup(self):
         if self.popup is not None:
@@ -397,11 +508,11 @@ class AntiAltF4App:
         with self._lock:
             n = self.attempts
         if n == 0:
-            text = "Anti Alt+F4 активен. Alt+F4 заблокирован 🛡️"
-            self._show_popup(text, 0)
-            # поправить счётчик в инфо-окне
-            if self.popup_counter is not None:
-                self.popup_counter.config(text="Попыток пока нет. Жми Alt+F4 😉")
+            self._show_popup(
+                "Приложение висит в трее. Alt+F4 не сработает — "
+                "вместо него появится окно с репликой.",
+                0,
+            )
         else:
             self._show_popup(REPLIKAS[min(n, MAX_ATTEMPTS) - 1], min(n, MAX_ATTEMPTS))
 
@@ -422,8 +533,20 @@ class AntiAltF4App:
         def on_exit(icon, item):
             self.events.put("exit")
 
+        def on_toggle_sound(icon, item):
+            self.sound_enabled = not self.sound_enabled
+            _log(f"звук {'вкл' if self.sound_enabled else 'выкл'}")
+            try:
+                icon.update_menu()
+            except Exception:
+                pass
+
         menu = pystray.Menu(
             pystray.MenuItem("Показать", on_show, default=True),
+            pystray.MenuItem(
+                "Звук", on_toggle_sound,
+                checked=lambda item: self.sound_enabled,
+            ),
             pystray.MenuItem("Выход", on_exit),
         )
         self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
@@ -523,6 +646,21 @@ def _fatal(msg):
         pass
 
 
+def _enable_dpi_awareness():
+    """Без этого при масштабировании 125/150% Windows размеры окна врут."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception as e:
+        _log(f"dpi awareness failed: {e}")
+
+
 def main():
     # любые необработанные исключения — в лог, а не молчаливый вылет
     def _hook_exc(exc_type, exc, tb):
@@ -530,6 +668,7 @@ def main():
 
         _log("unhandled: " + "".join(traceback.format_exception(exc_type, exc, tb)))
 
+    _enable_dpi_awareness()
     sys.excepthook = _hook_exc
     threading.excepthook = lambda a: _log(
         f"thread {getattr(a.thread, 'name', '?')} error: {a.exc_type.__name__}: {a.exc_value}"
