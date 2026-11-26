@@ -646,6 +646,20 @@ class AntiAltF4App:
             return
         self._exiting = True
         _log("выход")
+        # если выходим прямо во время скримера — вернуть звук и курсор
+        try:
+            if self.screamer is not None:
+                self.screamer.muter.panic_unmute()
+                self.screamer.cursor.unlock()
+                self.screamer._finish("выход из приложения")
+        except Exception as e:
+            _log(f"аварийное восстановление скримера: {e}")
+        try:
+            from screamer import stop_sound
+
+            stop_sound(_log)
+        except Exception:
+            pass
         try:
             self.hook.stop()
         except Exception:
@@ -671,6 +685,12 @@ class AntiAltF4App:
     # -- запуск ---------------------------------------------------------------
     def run(self):
         _log("старт приложения")
+        try:
+            import screamer
+
+            screamer.warmup(_log)
+        except Exception as e:
+            _log(f"прогрев звука не удался: {e}")
         self._setup_tray()
         if not self.hook.start():
             # вторая попытка: иногда первый SetWindowsHookExW не проходит
