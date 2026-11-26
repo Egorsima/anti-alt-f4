@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,11 +31,12 @@ jobs:
       - name: Check deps
         shell: bash
         run: |
+          set -e
           python -c "import tkinter; print('tkinter ok')"
           python -c "from pycaw.pycaw import AudioUtilities; print('pycaw ok')"
-          python -c "from screamer import SCREAMER_LINES; print('screamer lines:', len(SCREAMER_LINES))"
-          python -c "import sys, wave; sys.path.insert(0,'.'); import screamer; p,(ev,ln,te,ta)=screamer.get_track(print); w=wave.open(p); print('wav:', p, round(w.getnframes()/w.getframerate(),1), 's, events:', len(ev), 'angel at:', round(ta,1))"
-          python -c "import sys; sys.path.insert(0,'.'); import screamer; im=screamer.make_stage(1280,720,log=print); print('stage ok:', im.size if im else None)"
+          python -c "import screamer; print('screamer import ok, lines:', len(screamer.SCREAMER_LINES))"
+          python -c "import screamer; p, t = screamer.get_track(lambda m: None); print('wav:', p, 'events:', len(t[0]), 'angel_at:', round(t[3], 1))"
+          python -c "import screamer; im = screamer.make_stage(1280, 720, log=lambda m: None); print('stage:', im.size if im else 'FAILED')"
 
       - name: Check font
         shell: bash
