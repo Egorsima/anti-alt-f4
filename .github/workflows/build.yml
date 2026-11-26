@@ -39,6 +39,10 @@ jobs:
           python -c "import screamer; fr = screamer.load_frames(lambda m: None); print('frames:', len(fr), fr[0].size if fr else 'FAILED')"
           python -c "import screamer, os; print('sfx files:', len(os.listdir(screamer.resource_path('assets/sfx'))))"
 
+      - name: Smoke test screamer
+        shell: bash
+        run: python tools/smoketest_screamer.py
+
       - name: Check font
         shell: bash
         run: python -c "from PIL import ImageFont; f=ImageFont.truetype('arial.ttf', 20); print('font ok:', f)"

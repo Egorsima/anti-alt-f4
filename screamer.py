@@ -27,6 +27,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import wave
 from array import array
 
@@ -358,6 +359,35 @@ def frame_timeline():
     ]
 
 
+_frames_size = [None]
+
+
+def _frames_ready_size():
+    return _frames_size[0]
+
+
+def frames_for_screen(w, h, log=print):
+    """Кадры, отмасштабированные под экран (кэшируются)."""
+    global _frames_ready
+    frames = load_frames(log)
+    if not frames:
+        return []
+    if _frames_size[0] == (w, h):
+        return frames
+    t0 = time.time()
+    fitted = []
+    for img in frames:
+        try:
+            fitted.append(ImageOps.fit(img, (w, h), method=Image.BILINEAR,
+                                       centering=(0.5, 0.5)))
+        except Exception:
+            fitted.append(img)
+    _frames_ready = fitted
+    _frames_size[0] = (w, h)
+    log(f"кадры отмасштабированы под {w}x{h} за {time.time() - t0:.2f}s")
+    return _frames_ready
+
+
 def warmup(log=print):
     """Заранее готовим звук и кадры, чтобы скример стартовал мгновенно."""
     def _worker():
@@ -366,7 +396,9 @@ def warmup(log=print):
         except Exception as e:
             log(f"warmup sound failed: {e}")
         try:
-            load_frames(log)
+            _user32()  # на Windows уточняем реальное разрешение
+            x, y, w, h = virtual_screen()
+            frames_for_screen(w, h, log)
         except Exception as e:
             log(f"warmup frames failed: {e}")
 
@@ -636,6 +668,13 @@ class ScreamerOverlay:
         self._finished = False
         self._after_ids = []
 
+        # состояние печати (раньше не было инициализировано -> _render падал
+        # с AttributeError ещё до первого кадра, из-за этого скример «не показывался»)
+        self._lines_done = []
+        self._cur = ""
+        self._cursor_on = True
+        self._flash_i = 0
+
         self.muter = SessionMuter(log=log)
         self.cursor = CursorLock(log=log)
 
@@ -657,21 +696,30 @@ class ScreamerOverlay:
         self._after_ids = []
 
     # -- кадры ---------------------------------------------------------------
-    def _prepare_photos(self):
-        """JPEG -> PhotoImage под размер экрана (делаем на главном потоке)."""
+    def _prepare_photos(self, limit=None):
+        """JPEG -> PhotoImage под размер экрана.
+
+        Кадры уже отмасштабированы под самое распространённое разрешение при
+        прогреве, поэтому здесь максимум один лёгкий ресайз на кадр.
+        """
         if ImageTk is None:
-            return
-        frames = load_frames(self.log)
-        if not frames:
+            self.log("ImageTk недоступен — картинка не покажется")
             return
         w, h = self._screen
-        for i, img in enumerate(frames):
+        frames = frames_for_screen(w, h, self.log)
+        if not frames:
+            return
+        todo = frames if limit is None else frames[:limit]
+        for i, img in enumerate(todo):
             try:
-                fitted = ImageOps.fit(img, (w, h), method=Image.LANCZOS, centering=(0.5, 0.5))
-                self._photos[i] = ImageTk.PhotoImage(fitted)
+                self._photos[i] = ImageTk.PhotoImage(img)
             except Exception as e:
                 self.log(f"кадр {i} не подготовлен: {e}")
         self.log(f"кадры готовы к показу: {len(self._photos)}")
+        try:
+            self._label.update_idletasks()
+        except Exception:
+            pass
 
     def _show_frame(self, idx):
         if self._label is None:
@@ -751,12 +799,13 @@ class ScreamerOverlay:
 
     # -- печать --------------------------------------------------------------
     def _render(self):
-        parts = list(self._lines_done)
-        parts.append(self._cur + ("█" if self._cursor_on else ""))
         try:
-            self._text.config(text="\n".join(parts))
-        except Exception:
-            pass
+            parts = list(self._lines_done)
+            parts.append(self._cur + ("█" if self._cursor_on else ""))
+            if self._text is not None:
+                self._text.config(text="\n".join(parts))
+        except Exception as e:
+            self.log(f"render error: {e}")
 
     def _blink(self):
         if self._finished:
@@ -845,12 +894,15 @@ class ScreamerOverlay:
             self.log("скример: нет tkinter — показать окно невозможно")
             return
         self.log("скример: старт")
-        try:
-            self.set_input_blocked(True)
-        except Exception as e:
-            self.log(f"input block failed: {e}")
-        self.cursor.lock()
-        self.muter.start()
+        # режим проверки (CI): окно/кадры/печать без блокировки ввода и звука
+        self.smoke = os.environ.get("SCREAMER_SMOKE") == "1"
+        if not self.smoke:
+            try:
+                self.set_input_blocked(True)
+            except Exception as e:
+                self.log(f"input block failed: {e}")
+            self.cursor.lock()
+            self.muter.start()
 
         try:
             path, events, lines, t_angel = get_track(self.log)
@@ -860,15 +912,22 @@ class ScreamerOverlay:
 
         try:
             self._build_window()
-            self._prepare_photos()
+            # 1) сначала показываем первый кадр — окно уже не «висит» чёрным
+            self._prepare_photos(limit=1)
             self._show_frame(0)
             self._render()
             self._after(300, self._blink)
+            self._after(120, self._prepare_photos)  # остальные кадры, когда окно уже видно
             self._play_timeline()
-            if path:
+            if path and not self.smoke:
                 play_file(path, log=self.log)
             self._schedule_typing(events, lines)
-            self._after(t_angel * 1000, self._revive)
+            if self.smoke:
+                # проверяем, что кадры реально переключаются
+                self._after(2500, lambda: self.log(f"smoke: кадров показано {len(self._photos)}"))
+                self._after(3200, self._revive)
+            else:
+                self._after(t_angel * 1000, self._revive)
             self._after(MAX_DURATION_MS, lambda: self._finish("предохранитель"))
         except Exception:
             import traceback
@@ -902,7 +961,8 @@ class ScreamerOverlay:
         self.win = None
         self._cur_photo = None
         self._photos.clear()
-        for step in (self.cursor.unlock, self.muter.restore):
+        steps = () if getattr(self, "smoke", False) else (self.cursor.unlock, self.muter.restore)
+        for step in steps:
             try:
                 step()
             except Exception as e:
