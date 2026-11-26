@@ -802,15 +802,19 @@ class ScreamerOverlay:
             self._after(events[0][0] * 1000, step)
 
         for (start, end, line) in lines:
+            def start_line(start=start):
+                # новая строка печатается с чистого листа
+                cur["text"] = ""
+
             def done(line=line, end=end):
                 if self._finished:
                     return
                 self._lines_done.append(line)
                 self._cur = ""
                 self._render()
-                self.log(f"строка допечатана: {line[:24]}...")
 
-            self._after(end * 1000 + 60, done)
+            self._after(start * 1000, start_line)
+            self._after(end * 1000 + 40, done)
 
     # -- возрождение ---------------------------------------------------------
     def _revive(self):
