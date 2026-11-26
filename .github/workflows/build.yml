@@ -25,6 +25,14 @@ jobs:
           pip install -r requirements.txt pyinstaller
           python -c "import PIL; print('Pillow', PIL.__version__)"
 
+      - name: Check deps
+        shell: bash
+        run: |
+          python -c "import tkinter; print('tkinter ok')"
+          python -c "from pycaw.pycaw import AudioUtilities; print('pycaw ok')"
+          python -c "from screamer import SCREAMER_LINES; print('screamer lines:', len(SCREAMER_LINES))"
+          python -c "import sys; sys.path.insert(0,'.'); from screamer import click_sound_path; print('wav:', click_sound_path())"
+
       - name: Check font
         shell: bash
         run: python -c "from PIL import ImageFont; f=ImageFont.truetype('arial.ttf', 20); print('font ok:', f)"
@@ -37,11 +45,14 @@ jobs:
       - name: Build exe
         shell: bash
         run: |
+          DATA="assets/screamer.jpg;assets"
           if [ -f icon.ico ]; then
-            pyinstaller --onefile --noconsole --name anti-alt-f4 --icon icon.ico anti_alt_f4.py
+            pyinstaller --onefile --noconsole --name anti-alt-f4 --icon icon.ico \
+              --add-data "$DATA" anti_alt_f4.py
           else
             echo "icon.ico not found, building without icon"
-            pyinstaller --onefile --noconsole --name anti-alt-f4 anti_alt_f4.py
+            pyinstaller --onefile --noconsole --name anti-alt-f4 \
+              --add-data "$DATA" anti_alt_f4.py
           fi
           ls -la dist/
 

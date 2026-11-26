@@ -32,6 +32,7 @@ REPLIKAS = [
 
 APP_NAME = "Anti Alt+F4"
 MAX_ATTEMPTS = len(REPLIKAS)
+SCREAMER_ATTEMPT = MAX_ATTEMPTS + 1  # 10-е нажатие -> скример
 
 # --- оформление попапа ------------------------------------------------------
 BG = "#1a1a1a"
@@ -127,6 +128,7 @@ class AltF4Hook:
 
     def __init__(self, on_alt_f4):
         self.on_alt_f4 = on_alt_f4
+        self.block_all = False  # True = глотать любые клавиши (режим скримера)
         self._hook = None
         self._thread_id = None
         self._thread = None
@@ -205,6 +207,9 @@ class AltF4Hook:
 
         def _proc(nCode, wParam, lParam):
             try:
+                if nCode >= 0 and hook_self.block_all:
+                    # скример на экране: не пропускаем ни одну клавишу
+                    return 1
                 if nCode >= 0 and wParam in (hook_self.WM_KEYDOWN, hook_self.WM_SYSKEYDOWN):
                     info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                     if info.vkCode == hook_self.VK_F4:
@@ -283,6 +288,11 @@ class AntiAltF4App:
         self.popup = None
         self.popup_text = None
         self.popup_counter = None
+        self.popup_body = None
+        self.popup_header = None
+        self.input_blocked = False
+        self.screamer = None
+        self.screamer_busy = False
 
         self.sound_enabled = True
         self.hook = AltF4Hook(on_alt_f4=self._on_alt_f4_from_hook)
@@ -295,12 +305,66 @@ class AntiAltF4App:
         self.events.put("alt_f4")
 
     def _handle_alt_f4(self):
+        if self.screamer_busy:
+            return
         with self._lock:
             self.attempts += 1
-            n = min(self.attempts, MAX_ATTEMPTS)
+            attempts = self.attempts
+        if attempts >= SCREAMER_ATTEMPT:
+            # 10-е нажатие: скример, потом счётчик начинается заново
+            _log(f"Alt+F4 заблокирован, попытка #{attempts} -> СКРИМЕР")
+            self._close_popup()
+            # даём окну успеть исчезнуть, чтобы не мешало полноэкранному слою
+            self.root.after(60, self._run_screamer)
+            return
+        n = min(attempts, MAX_ATTEMPTS)
         text = REPLIKAS[n - 1]
-        _log(f"Alt+F4 заблокирован, попытка #{self.attempts}: {text}")
+        _log(f"Alt+F4 заблокирован, попытка #{attempts}: {text}")
         self._show_popup(text, n)
+
+    # -- скример -------------------------------------------------------------
+    def _run_screamer(self):
+        if self.screamer_busy:
+            return
+        self._close_popup()
+        self.screamer_busy = True
+        try:
+            from screamer import ScreamerOverlay
+        except Exception as e:
+            _log(f"скример недоступен: {e}")
+            self.screamer_busy = False
+            return
+
+        def _done():
+            self.screamer_busy = False
+            self.screamer = None
+            with self._lock:
+                self.attempts = 0  # после скримера всё по новой
+            _log("скример отработал, счётчик сброшен")
+
+        try:
+            self.screamer = ScreamerOverlay(
+                self.root,
+                log=_log,
+                set_input_blocked=self._set_input_blocked,
+                on_done=_done,
+            )
+            self.screamer.show()
+        except Exception:
+            import traceback
+
+            _log("скример упал: " + traceback.format_exc())
+            self.screamer_busy = False
+            self._set_input_blocked(False)
+
+    def _set_input_blocked(self, flag):
+        """Пока скример на экране — хук глотает вообще все клавиши."""
+        self.input_blocked = flag
+        try:
+            self.hook.block_all = flag
+        except Exception:
+            pass
+        _log(f"ввод {'заблокирован' if flag else 'разблокирован'}")
 
     # -- окно по центру ------------------------------------------------------
     def _center_window(self, win, width, height):
@@ -510,7 +574,8 @@ class AntiAltF4App:
         if n == 0:
             self._show_popup(
                 "Приложение висит в трее. Alt+F4 не сработает — "
-                "вместо него появится окно с репликой.",
+                "вместо него появится окно с репликой. "
+                "На 10-й раз... ну, сам увидишь.",
                 0,
             )
         else:
@@ -533,6 +598,10 @@ class AntiAltF4App:
         def on_exit(icon, item):
             self.events.put("exit")
 
+        def on_screamer_test(icon, item):
+            # сознательно вызывается ТОЛЬКО из трея
+            self.events.put("screamer_test")
+
         def on_toggle_sound(icon, item):
             self.sound_enabled = not self.sound_enabled
             _log(f"звук {'вкл' if self.sound_enabled else 'выкл'}")
@@ -543,6 +612,7 @@ class AntiAltF4App:
 
         menu = pystray.Menu(
             pystray.MenuItem("Показать", on_show, default=True),
+            pystray.MenuItem("Проверить скример", on_screamer_test),
             pystray.MenuItem(
                 "Звук", on_toggle_sound,
                 checked=lambda item: self.sound_enabled,
@@ -617,6 +687,8 @@ class AntiAltF4App:
                         self._handle_alt_f4()
                     elif ev == "show_info":
                         self._show_info()
+                    elif ev == "screamer_test":
+                        self._run_screamer()
                     elif ev == "exit":
                         self._exit()
                         return
