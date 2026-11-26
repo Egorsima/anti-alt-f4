@@ -76,16 +76,41 @@ def write(name, d, peak=0.9):
 
 
 # ---------------------------------------------------------------------------
+def lowpass(d, cutoff=1200.0, taps=127):
+    """Простой FIR-фильтр низких частот (окно Хэмминга) — убирает «цифровой» верх."""
+    if len(d) < taps:
+        return d
+    n = np.arange(taps) - (taps - 1) / 2.0
+    fc = cutoff / RATE
+    h = np.sinc(2 * fc * n) * np.hamming(taps)
+    h /= h.sum()
+    return np.convolve(d, h, mode="same")
+
+
+def pitch_down(d, ratio=0.82):
+    n = int(len(d) / ratio)
+    return np.interp(np.linspace(0, len(d) - 1, n), np.arange(len(d)), d)
+
+
 def build_keys():
     """Удары «по клавишам» — настоящие механические клики."""
     for name, rel, peak in [
-        ("key1.wav", "mechanical/press.ogg", 0.85),
+        ("key1.wav", "mechanical/press.ogg", 0.85),  # лёгкий клик
         ("key2.wav", "mechanical/typing.ogg", 0.95),
         ("key3.wav", "mechanical/double-click.ogg", 0.8),
         ("key4.wav", "mechanical/lock.ogg", 0.75),
     ]:
         d = norm(trim(load(rel)), peak)
         write(name, fade(d, 1, 6), peak=1.0)
+
+
+def build_heavy_key():
+    """Основной удар: press, но ниже по тону и с убранным верхом — звучит «в груди»."""
+    d = trim(load("mechanical/press.ogg"), thresh=0.004)
+    d = pitch_down(d, 0.72)
+    d = lowpass(d, 1800.0)
+    d = norm(d, 0.9)
+    write("key_hit.wav", fade(d, 1, 20), peak=1.0)
 
 
 def build_accent():
@@ -120,6 +145,54 @@ def build_bed():
     sub = np.sin(2 * np.pi * 46.0 * t) * 0.10 * (0.6 + 0.4 * np.sin(2 * np.pi * 0.12 * t))
     out = norm(out * 0.85 + sub, 0.62)
     write("bed.wav", fade(out, 60, 60), peak=1.0)
+
+
+def build_wind():
+    """Тихий жуткий эмбиент: ветер в лесу, далёкий скрип, почти без верха.
+
+    Генерируется (а не берётся из сэмплов) — зато бесшовная петля 14 с и
+    ровно то настроение, что нужно: «где-то рядом, но не видно».
+    """
+    rnd = np.random.default_rng(20240521)
+    dur = 14.0
+    n = int(RATE * dur)
+    t = np.arange(n) / RATE
+
+    # 1) основа: коричневый шум (низкий ветер)
+    white = rnd.normal(0, 1, n)
+    brown = np.cumsum(white)
+    brown -= np.linspace(brown[0], brown[-1], n)  # убираем дрейф
+    brown /= np.abs(brown).max() + 1e-9
+    brown = lowpass(brown, 700.0)
+
+    # 2) порывы: медленная модуляция + второй слой с другой фазой
+    gust1 = 0.55 + 0.45 * np.sin(2 * np.pi * 0.07 * t + 0.8)
+    gust2 = 0.45 + 0.55 * np.sin(2 * np.pi * 0.11 * t + 2.1)
+    wind = brown * (gust1 * 0.6 + gust2 * 0.4)
+
+    # 3) «листва»: узкополосный шум вокруг 2.3 кГц, очень тихо
+    leaf_n = rnd.normal(0, 1, n)
+    leaf = lowpass(leaf_n, 3200.0) - lowpass(leaf_n, 1800.0)
+    leaf = leaf / (np.abs(leaf).max() + 1e-9)
+    leaf *= 0.055 * (0.5 + 0.5 * np.sin(2 * np.pi * 0.19 * t + 1.2))
+
+    # 4) далёкий скрип дерева: две синусоиды с биениями, раз в ~7 с
+    creak_env = np.clip(np.sin(2 * np.pi * 0.072 * t - 1.1), 0, 1) ** 6
+    creak = (np.sin(2 * np.pi * 128 * t) * 0.5 + np.sin(2 * np.pi * 131.7 * t) * 0.35)
+    creak *= creak_env * 0.09
+
+    # 5) саб-подложка «что-то внизу»
+    sub = np.sin(2 * np.pi * 43.0 * t) * 0.05 * (0.5 + 0.5 * np.sin(2 * np.pi * 0.05 * t))
+
+    mix = lowpass(wind * 0.6 + leaf + creak + sub, 1400.0)
+    # мягкая петля: кроссфейд первых/последних 1.2 с
+    x = int(1.2 * RATE)
+    head, tail = mix[:x].copy(), mix[-x:].copy()
+    w = np.linspace(0, 1, x)
+    mix[:x] = head * w + tail * (1 - w)
+    mix = mix[:-x]
+    mix = norm(mix, 0.42)
+    write("wind.wav", mix, peak=1.0)
 
 
 def build_angel():
@@ -182,7 +255,9 @@ def main():
         return 1
     print(f"источник: {SRC}\nвыход: {OUT}\n")
     build_keys()
+    build_heavy_key()
     build_accent()
+    build_wind()
     build_bed()
     build_angel()
     build_notifications()

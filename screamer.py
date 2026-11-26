@@ -33,6 +33,7 @@ from array import array
 
 try:
     import tkinter as tk
+    from tkinter import font as tkfont
 except Exception:  # без tkinter модуль всё равно импортируется (тесты/логи)
     tk = None
 
@@ -63,9 +64,10 @@ HOLD_AFTER_LAST = 1.1
 MAX_DURATION_MS = 120_000  # предохранитель
 
 # громкости слоёв
-VOL_BED = 0.55
-VOL_KEY = 0.95
-VOL_ACCENT = 0.75
+VOL_WIND = 0.5      # тихий жуткий эмбиент (лес/ветер) — на фоне
+VOL_BED = 0.16      # низкий гул, совсем чуть-чуть
+VOL_KEY = 1.0
+VOL_ACCENT = 0.6
 VOL_ANGEL = 1.0
 
 
@@ -217,9 +219,11 @@ def compose_track(log=print):
     total = t_angel + 6.2
     n = int(total * RATE)
 
+    wind = read_wav(sfx_path("wind.wav"))
     bed = read_wav(sfx_path("bed.wav"))
     keys = [read_wav(sfx_path(f"key{i}.wav")) for i in (1, 2, 3, 4)]
     keys = [k for k in keys if k]
+    hit = read_wav(sfx_path("key_hit.wav"))
     accent = read_wav(sfx_path("accent.wav"))
     angel = read_wav(sfx_path("angel.wav"))
 
@@ -227,32 +231,41 @@ def compose_track(log=print):
     if len(buf) != n:
         buf = array("f", [0.0] * n)
 
-    # 1) гул, зацикленный до момента ангела, с затуханием перед ним
+    # 1) эмбиент леса + низкий гул, зацикленные до момента ангела
+    end_bed = int(t_angel * RATE)
+    fade_len = int(0.7 * RATE)
+    start_fade = max(0, end_bed - fade_len)
+    if wind:
+        wn = len(wind)
+        for i in range(min(n, end_bed)):
+            buf[i] += wind[i % wn] * VOL_WIND
     if bed:
         bn = len(bed)
-        end_bed = int(t_angel * RATE)
         for i in range(min(n, end_bed)):
             buf[i] += bed[i % bn] * VOL_BED
-        fade_len = int(0.7 * RATE)
-        start_fade = max(0, end_bed - fade_len)
-        for i in range(start_fade, min(n, end_bed)):
-            buf[i] *= (end_bed - i) / fade_len
+    # перед ангелом всё стихает
+    for i in range(start_fade, min(n, end_bed)):
+        buf[i] *= (end_bed - i) / fade_len
 
-    # 2) удары по клавишам
-    if keys:
-        rnd = random.Random(777)
-        for (t, ch) in events:
-            if ch.isspace():
-                continue
-            sample = rnd.choice(keys)
-            off = int(t * RATE)
-            sn = len(sample)
-            gain = VOL_KEY * rnd.uniform(0.75, 1.0)
-            for j in range(sn):
-                k = off + j
-                if k >= n:
-                    break
-                buf[k] += sample[j] * gain
+    # 2) удары по клавишам: каждый третий — тяжёлый низкий удар,
+    #    остальные — короткие клики (звучит «дороже» и не так дёшево)
+    rnd = random.Random(777)
+    idx = 0
+    for (t, ch) in events:
+        if ch.isspace():
+            continue
+        idx += 1
+        use_hit = hit and (idx % 3 == 0)
+        sample = hit if use_hit else (rnd.choice(keys) if keys else None)
+        if not sample:
+            continue
+        off = int(t * RATE)
+        gain = VOL_KEY * (1.0 if use_hit else rnd.uniform(0.55, 0.8))
+        for j in range(len(sample)):
+            k = off + j
+            if k >= n:
+                break
+            buf[k] += sample[j] * gain
 
     # 3) акцент на точках и многоточиях
     if accent:
@@ -625,6 +638,43 @@ def _topmost_fullscreen(win, x, y, w, h, log=print):
         log(f"SetWindowPos failed: {e}")
 
 
+VK_MENU = 0x12
+VK_SHIFT = 0x10
+VK_CONTROL = 0x11
+VK_LWIN = 0x5B
+VK_RWIN = 0x5C
+KEYEVENTF_KEYUP = 0x0002
+
+
+def release_stuck_modifiers(log=print):
+    """После скримера Alt/Shift/Ctrl/Win остаются «зажатыми» для системы:
+    окно глотало keydown, а физический keyup приходил позже и терялся.
+    Из-за этого потом «клик не работает, пока не нажмёшь Alt».
+    """
+    if os.name != "nt":
+        return
+    try:
+        u = ctypes.windll.user32
+        u.keybd_event.restype = None
+        released = []
+        for vk, name in (
+            (VK_MENU, "Alt"),
+            (VK_SHIFT, "Shift"),
+            (VK_CONTROL, "Ctrl"),
+            (VK_LWIN, "Win"),
+            (VK_RWIN, "Win"),
+        ):
+            if u.GetAsyncKeyState(vk) & 0x8000:
+                u.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+                released.append(name)
+        if released:
+            log(f"отпустил зажатые клавиши: {', '.join(released)}")
+        else:
+            log("зажатых клавиш не было")
+    except Exception as e:
+        log(f"release stuck keys failed: {e}")
+
+
 def _become_foreground(win, log=print):
     if os.name != "nt":
         return
@@ -674,6 +724,9 @@ class ScreamerOverlay:
         self._cur = ""
         self._cursor_on = True
         self._flash_i = 0
+        self._text_color = "#f2f2f2"
+        self._text_w = 900
+        self._font = None
 
         self.muter = SessionMuter(log=log)
         self.cursor = CursorLock(log=log)
@@ -752,16 +805,22 @@ class ScreamerOverlay:
         self._label = tk.Label(win, bd=0, bg="black")
         self._label.place(x=0, y=0, width=w, height=h)
 
-        self._text = tk.Label(
-            win,
-            text="",
-            bg="black",
-            fg="#f2f2f2",
-            font=("Consolas", 26, "bold"),
-            justify="center",
-            wraplength=int(w * 0.70),
+        # текст рисуем на Canvas: сами считаем ширину и переносим строки,
+        # поэтому ничего не «прыгает» и не вылезает за плашку
+        self._text_w = int(w * 0.74)
+        font_size = max(16, int(h * 0.036))
+        self._font = tkfont.Font(family="Consolas", size=font_size, weight="bold")
+        self._text = tk.Canvas(
+            win, width=self._text_w, height=int(h * 0.42),
+            bg="black", highlightthickness=0, bd=0,
         )
-        self._text.place(relx=0.5, rely=0.53, anchor="center")
+        self._text.place(relx=0.5, rely=0.55, anchor="center")
+
+        # мягкая тёмная подложка: текст читается на любом кадре
+        shadow = tk.Frame(win, bg="#050505")
+        shadow.place(relx=0.5, rely=0.55, anchor="center",
+                     width=self._text_w + 48, height=int(h * 0.42) + 24)
+        shadow.lower(self._text)
 
         win.bind("<Alt-F4>", lambda e: "break")
         win.bind("<Escape>", lambda e: "break")
@@ -798,12 +857,57 @@ class ScreamerOverlay:
         self._after(600, self._keep_focus)
 
     # -- печать --------------------------------------------------------------
-    def _render(self):
+    def _max_chars(self):
+        """Сколько символов влезает в блок при текущем кегле."""
         try:
-            parts = list(self._lines_done)
-            parts.append(self._cur + ("█" if self._cursor_on else ""))
-            if self._text is not None:
-                self._text.config(text="\n".join(parts))
+            return max(8, int(self._text_w * 0.94 / max(1.0, self._font.measure("M"))))
+        except Exception:
+            return 40
+
+    def _wrap_line(self, text):
+        """Перенос по словам под ширину блока (шрифт фиксированной ширины)."""
+        max_chars = self._max_chars()
+        out = []
+        line = ""
+        for word in text.split(" "):
+            trial = word if not line else line + " " + word
+            if len(trial) <= max_chars:
+                line = trial
+            else:
+                if line:
+                    out.append(line)
+                # очень длинное слово — режем
+                while len(word) > max_chars:
+                    out.append(word[:max_chars])
+                    word = word[max_chars:]
+                line = word
+        out.append(line)
+        return out
+
+    def _render(self):
+        """Перерисовка текста: все допечатанные строки + текущая с курсором."""
+        try:
+            if self._text is None:
+                return
+            c = self._text
+            c.delete("all")
+            lines = []
+            for done_line in self._lines_done:
+                lines.extend(self._wrap_line(done_line))
+            cur = self._cur + ("█" if self._cursor_on else "")
+            lines.extend(self._wrap_line(cur) if cur else [""])
+
+            line_h = int(self._font.metrics("linespace") * 1.32)
+            height = c.winfo_height() or 1
+            width = self._text_w
+            # блок держим по центру: сколько бы строк ни было
+            total = len(lines) * line_h
+            y = max(6, (height - total) // 2)
+            for txt in lines:
+                if txt:
+                    c.create_text(width // 2, y, text=txt, font=self._font,
+                                  fill=self._text_color, anchor="n")
+                y += line_h
         except Exception as e:
             self.log(f"render error: {e}")
 
@@ -813,10 +917,7 @@ class ScreamerOverlay:
         self._cursor_on = not self._cursor_on
         shades = ["#f2f2f2", "#cfcfcf", "#ffffff", "#a9a9a9", "#f2f2f2", "#fafafa"]
         self._flash_i = getattr(self, "_flash_i", 0) + 1
-        try:
-            self._text.config(fg=shades[self._flash_i % len(shades)])
-        except Exception:
-            pass
+        self._text_color = shades[self._flash_i % len(shades)]
         self._render()
         self._after(340, self._blink)
 
@@ -882,7 +983,8 @@ class ScreamerOverlay:
         try:
             self._label.config(image="", bg=color)
             self._cur_photo = None
-            self._text.config(text="", bg=color)
+            self._text.delete("all")
+            self._text.configure(bg=color)
             self.win.configure(bg=color)
         except Exception:
             pass
@@ -967,10 +1069,24 @@ class ScreamerOverlay:
                 step()
             except Exception as e:
                 self.log(f"restore step failed: {e}")
+        # сначала снимаем блокировку хука, потом отпускаем «залипшие» Alt/Shift/Ctrl
+        # (пока хук глотает всё, синтетический keyup тоже был бы съеден)
         try:
             self.set_input_blocked(False)
         except Exception as e:
             self.log(f"input unblock failed: {e}")
+        if not getattr(self, "smoke", False):
+            try:
+                time.sleep(0.05)
+                release_stuck_modifiers(self.log)
+            except Exception as e:
+                self.log(f"release keys failed: {e}")
+        # приложение переустановит хук: пока он глотал ВСЁ, часть keyup терялась
+        try:
+            if not getattr(self, "smoke", False):
+                time.sleep(0.05)
+        except Exception:
+            pass
         if self.on_done is not None:
             try:
                 self.on_done()

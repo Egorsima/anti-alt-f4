@@ -341,6 +341,12 @@ class AntiAltF4App:
             with self._lock:
                 self.attempts = 0  # после скримера всё по новой
             _log("скример отработал, счётчик сброшен")
+            # переустанавливаем хук «с чистого листа»: пока скример глотал все
+            # клавиши, система могла «потерять» отпускание Alt -> залипший Alt
+            try:
+                self._reinstall_hook()
+            except Exception as e:
+                _log(f"переустановка хука не удалась: {e}")
 
         try:
             self.screamer = ScreamerOverlay(
@@ -356,6 +362,24 @@ class AntiAltF4App:
             _log("скример упал: " + traceback.format_exc())
             self.screamer_busy = False
             self._set_input_blocked(False)
+
+    def _reinstall_hook(self):
+        """Снять и заново поставить низкоуровневый хук (сбрасывает залипшие клавиши)."""
+        try:
+            self.hook.stop()
+        except Exception:
+            pass
+        import time as _t
+
+        _t.sleep(0.15)
+        ok = self.hook.start()
+        _log(f"хук переустановлен: {ok}")
+        if not ok:
+            # вторая попытка, как при старте
+            _t.sleep(0.4)
+            ok = self.hook.start()
+            _log(f"хук переустановлен со 2-й попытки: {ok}")
+        return ok
 
     def _set_input_blocked(self, flag):
         """Пока скример на экране — хук глотает вообще все клавиши."""

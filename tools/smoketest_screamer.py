@@ -61,6 +61,40 @@ def logic_checks():
     except Exception as e:
         check("_show_frame без кадров не падает", False, repr(e))
 
+    # залипшие клавиши: функция должна существовать и не падать
+    try:
+        screamer.release_stuck_modifiers(lambda m: None)
+        check("release_stuck_modifiers не падает", True)
+    except Exception as e:
+        check("release_stuck_modifiers не падает", False, repr(e))
+
+    # перенос текста: блок 900px, шрифт 20px/символ -> длинные строки переносятся,
+    # короткие остаются одной строкой (раньше текст «ломался» и вылезал)
+    class FakeFont:
+        def measure(self, m):
+            return 20
+
+    o2 = screamer.ScreamerOverlay.__new__(screamer.ScreamerOverlay)
+    o2._font = FakeFont()
+    o2._text_w = 900
+    wrapped = [o2._wrap_line(l) for l in screamer.SCREAMER_LINES]
+    check("короткие строки не переносятся", len(wrapped[0]) == 1, wrapped[0])
+    check("длинные строки переносятся", max(len(w) for w in wrapped) >= 1,
+          [len(w) for w in wrapped])
+    check("строк в блоке немного", sum(len(w) for w in wrapped) <= 8,
+          f"всего строк: {sum(len(w) for w in wrapped)}")
+
+    # эмбиент должен быть в миксе (тихий фон)
+    import wave as _wave
+    try:
+        p, _e, _l, _ta = screamer.get_track(lambda m: None)
+        with _wave.open(p) as w:
+            frames_n = w.getnframes()
+            rate = w.getframerate()
+        check("трек длиннее 20с", frames_n / rate > 20, f"{frames_n / rate:.1f}s")
+    except Exception as e:
+        check("трек читается", False, repr(e))
+
     # таймлайн печати: строки не должны склеиваться в одну
     events, lines, t_end = screamer.build_timeline()
     check("в таймлайне 4 строки", len(lines) == 4, f"строк: {len(lines)}")
