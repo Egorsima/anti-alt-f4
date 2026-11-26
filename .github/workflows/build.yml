@@ -18,15 +18,31 @@ jobs:
           python-version: "3.12"
 
       - name: Install deps
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
+          python -c "import PIL; print('Pillow', PIL.__version__)"
+
+      - name: Check font
+        shell: bash
+        run: python -c "from PIL import ImageFont; f=ImageFont.truetype('arial.ttf', 20); print('font ok:', f)"
 
       - name: Make icon
+        shell: bash
+        continue-on-error: true
         run: python make_icon.py
 
       - name: Build exe
-        run: pyinstaller --onefile --noconsole --name anti-alt-f4 --icon icon.ico anti_alt_f4.py
+        shell: bash
+        run: |
+          if [ -f icon.ico ]; then
+            pyinstaller --onefile --noconsole --name anti-alt-f4 --icon icon.ico anti_alt_f4.py
+          else
+            echo "icon.ico not found, building without icon"
+            pyinstaller --onefile --noconsole --name anti-alt-f4 anti_alt_f4.py
+          fi
+          ls -la dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
