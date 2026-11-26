@@ -2,25 +2,31 @@
 """
 Скример (10-я «реплика») + «возрождение» после него.
 
-Скример:
-  * на весь экран (все мониторы) картинка без рамок и кнопок, поверх всего;
-  * виньетка + эффект объёма (лицо «выпирает» из темноты, экран медленно дышит);
-  * по центру по одной букве печатается текст — со злым звуком и низким гулом;
-  * глушит звук всех остальных приложений (Discord в том числе), кроме своего;
-  * блокирует клавиатуру, мышь, переключение окон; курсор заморожен и не виден;
+Звук — не синтез на ходу, а заранее подготовленные сэмплы из открытой
+библиотеки uisfx (MIT, https://github.com/romainsimon/uisfx): они лежат в
+assets/sfx/*.wav, а «тяжёлая» обработка делается в tools/build_sfx.py.
+
+Картинка — своя, из assets/frames.bin (набор кадров, собранных
+tools/build_frames.py): лицо «висит» в темноте, дышит, дёргается, глитчит.
+
+Что происходит на 10-е нажатие Alt+F4:
+  * на весь экран (все мониторы) кадры без рамок и кнопок, поверх всего;
+  * по центру по одной букве печатается текст — удар на каждую клавишу,
+    глухой гул фоном, стеклянный акцент на точках;
+  * звук всех остальных приложений (Discord в том числе) глушится;
+  * клавиатура, мышь и переключение окон блокируются;
   * после последней строки — белая вспышка и «ангельский» звук: возрождение.
 
 Ограничение: Ctrl+Alt+Del перехватить невозможно (это защита самой Windows).
 """
 
 import ctypes
-import math
 import os
 import random
+import struct
 import sys
 import tempfile
 import threading
-import time
 import wave
 from array import array
 
@@ -30,12 +36,12 @@ except Exception:  # без tkinter модуль всё равно импорт�
     tk = None
 
 try:
-    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+    from PIL import Image, ImageOps
 except Exception:  # pragma: no cover
     Image = None
 try:
     from PIL import ImageTk
-except Exception:  # ImageTk требует tkinter; без него просто не покажем кадры
+except Exception:  # ImageTk требует tkinter
     ImageTk = None
 
 # ---------------------------------------------------------------------------
@@ -48,25 +54,42 @@ SCREAMER_LINES = [
     "поверь.. твоим тиммейтам это точно не нравится...",
 ]
 
-SCREAMER_IMAGE = "assets/screamer.jpg"
-
 RATE = 22050
 CHAR_DELAY_MIN = 0.055
 CHAR_DELAY_MAX = 0.115
 LINE_PAUSE = 0.95
 HOLD_AFTER_LAST = 1.1
-ANGEL_DUR = 5.2
-MAX_DURATION_MS = 120_000  # предохранитель: дольше скример не живёт
+MAX_DURATION_MS = 120_000  # предохранитель
+
+# громкости слоёв
+VOL_BED = 0.55
+VOL_KEY = 0.95
+VOL_ACCENT = 0.75
+VOL_ANGEL = 1.0
 
 
 # ---------------------------------------------------------------------------
-# утилиты
+# Пути и ресурсы
 # ---------------------------------------------------------------------------
 def resource_path(rel):
     base = getattr(sys, "_MEIPASS", None)
     if base:
         return os.path.join(base, rel)
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
+
+
+def sfx_path(name):
+    return resource_path(os.path.join("assets", "sfx", name))
+
+
+def frames_path():
+    return resource_path(os.path.join("assets", "frames.bin"))
+
+
+def notify_sound_path(n):
+    """Звук для окна с репликой: 1–9, по нарастающей."""
+    n = max(1, min(9, int(n or 1)))
+    return sfx_path(f"notify{n}.wav")
 
 
 def _user32():
@@ -91,97 +114,74 @@ def virtual_screen():
 
 
 # ---------------------------------------------------------------------------
-# Синтез звука
+# Звук: чтение сэмплов, микс трека, воспроизведение
 # ---------------------------------------------------------------------------
-def _clip(v, peak=0.95):
-    if v > 1.0:
-        v = 1.0
-    elif v < -1.0:
-        v = -1.0
-    return int(v * 32767 * peak)
+_wav_cache = {}
 
 
-def _shatter():
-    """Злой «удар-щелчок»: низкий толчок + треск + металлический скрежет."""
-    rnd = random.Random(1337)
-    dur = 0.19
-    n = int(RATE * dur)
-    out = []
-    prev = 0.0
-    for i in range(n):
-        t = i / RATE
-        hit = math.exp(-t * 26.0)                     # общая атака
-        thump = math.sin(2 * math.pi * (52 - 24 * min(t / dur, 1)) * t) * math.exp(-t * 11.0)
-        metal = (
-            math.sin(2 * math.pi * 2270 * t + 1.7 * math.sin(2 * math.pi * 13 * t))
-            + 0.65 * math.sin(2 * math.pi * 3310 * t)
-            + 0.4 * math.sin(2 * math.pi * 4210 * t)
-        ) * math.exp(-t * 38.0)
-        noise = rnd.uniform(-1.0, 1.0)
-        hp = noise - prev                             # хайпас: сухое шипение
-        prev = noise
-        v = thump * 0.95 + hp * 0.85 * hit + metal * 0.42 + noise * 0.10 * hit
-        out.append(_clip(v, 0.92))
+def read_wav(path):
+    """mono float32-подобный array('f') в диапазоне [-1, 1]."""
+    if path in _wav_cache:
+        return _wav_cache[path]
+    out = array("f")
+    try:
+        with wave.open(path, "rb") as w:
+            ch = w.getnchannels()
+            sw = w.getsampwidth()
+            sr = w.getframerate()
+            raw = w.readframes(w.getnframes())
+        if sw != 2:
+            raise ValueError(f"ожидался 16-bit wav: {path}")
+        pcm = array("h")
+        pcm.frombytes(raw)
+        if ch > 1:
+            # усредняем каналы
+            pcm = array("h", [sum(pcm[i:i + ch]) // ch for i in range(0, len(pcm), ch)])
+        if sr != RATE:
+            # простой ресемпл (ассеты и так в 22050, страховка)
+            n = int(len(pcm) * RATE / sr)
+            out = array("f", [pcm[int(i * sr / RATE)] / 32768.0 for i in range(n)])
+        else:
+            out = array("f", [v / 32768.0 for v in pcm])
+    except Exception as e:
+        print(f"[sfx] не прочитал {path}: {e}", file=sys.stderr)
+        return array("f")
+    _wav_cache[path] = out
     return out
 
 
-def _drone():
-    """Низкий гул (3 с, бесшовный цикл) — «что-то не так»."""
-    dur = 3.0
-    n = int(RATE * dur)
-    rnd = random.Random(99)
-    out = []
-    for i in range(n):
-        t = i / RATE
-        a = math.sin(2 * math.pi * 38.5 * t)
-        b = math.sin(2 * math.pi * 57.7 * t + 1.2 * math.sin(2 * math.pi * 0.19 * t))
-        c = math.sin(2 * math.pi * 92.0 * t) * 0.35
-        breath = 0.5 + 0.5 * math.sin(2 * math.pi * 0.14 * t)
-        air = rnd.uniform(-1.0, 1.0) * 0.03 * breath
-        v = (a * 0.55 + b * 0.35 + c) * 0.45 * breath + air
-        fade = min(1.0, i / (0.06 * RATE), (n - i) / (0.06 * RATE))
-        out.append(v * fade)
-    return out
+def play_file(path, loop=False, log=print):
+    if os.name != "nt":
+        return
+    try:
+        import winsound
+
+        flags = winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT
+        if loop:
+            flags |= winsound.SND_LOOP
+        winsound.PlaySound(path, flags)
+    except Exception as e:
+        log(f"play error: {e}")
 
 
-def _angel():
-    """Возрождение: хор чистых квинт/октав + колокольчики + подъём."""
-    n = int(RATE * ANGEL_DUR)
-    notes = [523.25, 659.25, 783.99, 1046.5, 1318.5]
-    bells = (0.05, 0.7, 1.5, 2.4, 3.4, 4.3)
-    out = []
-    for i in range(n):
-        t = i / RATE
-        env = min(1.0, t / 0.45)
-        rel = max(0.0, t - (ANGEL_DUR - 1.6))
-        env *= math.exp(-rel * 2.0)
-        v = 0.0
-        for k, f in enumerate(notes):
-            vib = 1.0 + 0.0045 * math.sin(2 * math.pi * (4.2 + k * 0.5) * t)
-            v += math.sin(2 * math.pi * f * vib * t) * (0.5 ** k)
-        bell = 0.0
-        for bt in bells:
-            dt = t - bt
-            if dt > 0:
-                bell += math.sin(2 * math.pi * 2093 * dt) * math.exp(-dt * 2.6) * 0.16
-                bell += math.sin(2 * math.pi * 3136 * dt) * math.exp(-dt * 4.4) * 0.07
-        # «свет»: лёгкий восходящий шум-воздух
-        air = math.sin(2 * math.pi * 523.25 * t * 0.5) * 0.05 * min(1.0, t / 1.5)
-        v = (v * 0.42 + bell + air) * env
-        out.append(v)
-    return out
+def stop_sound(log=print):
+    if os.name != "nt":
+        return
+    try:
+        import winsound
+
+        winsound.PlaySound(None, winsound.SND_PURGE)
+    except Exception as e:
+        log(f"stop sound error: {e}")
 
 
-# --- таймлайн печати и общий трек ------------------------------------------
-_track = None
-_track_lock = threading.Lock()
-_track_path = None
-
-
+# ---------------------------------------------------------------------------
+# Таймлайн печати
+# ---------------------------------------------------------------------------
 def build_timeline(seed=424242):
-    """Один раз считаем, когда какая буква печатается — звук и окно идут синхронно."""
+    """Когда какая буква печатается. Один источник правды и для звука, и для окна."""
     rnd = random.Random(seed)
-    t = 1.0  # даём окну появиться
+    t = 1.0
     events = []
     lines = []
     for li, line in enumerate(SCREAMER_LINES):
@@ -200,114 +200,179 @@ def build_timeline(seed=424242):
     return events, lines, t
 
 
-def _build_track():
-    """Склеиваем ОДИН wav: гул + удары по буквам + ангел в конце.
+_track_lock = threading.Lock()
+_track_ready = None  # (wav_path, events, lines, t_angel)
 
-    winsound умеет играть только один звук за раз, поэтому всё микшируем заранее.
+
+def compose_track(log=print):
+    """Микширует ОДИН wav: гул + удары по клавишам + акценты + ангел в конце.
+
+    Всё в stdlib: winsound умеет играть только один файл, поэтому слои
+    складываем заранее. Готовится в фоне при старте приложения.
     """
+    started = __import__("time").time()
     events, lines, t_end = build_timeline()
     t_angel = t_end + HOLD_AFTER_LAST
-    total = t_angel + ANGEL_DUR + 0.4
+    total = t_angel + 6.2
     n = int(total * RATE)
-    buf = [0.0] * n
 
-    drone = _drone()
-    dn = len(drone)
-    # гул на всю длину, с затуханием к моменту ангела
-    for i in range(min(n, int(t_angel * RATE))):
-        buf[i] = drone[i % dn] * 0.9
-    # плавно убираем гул на последних 0.6 с перед ангелом
-    fade_from = max(0, int(t_angel * RATE) - int(0.6 * RATE))
-    for i in range(fade_from, min(n, int(t_angel * RATE))):
-        k = (int(t_angel * RATE) - i) / (0.6 * RATE)
-        buf[i] *= k
+    bed = read_wav(sfx_path("bed.wav"))
+    keys = [read_wav(sfx_path(f"key{i}.wav")) for i in (1, 2, 3, 4)]
+    keys = [k for k in keys if k]
+    accent = read_wav(sfx_path("accent.wav"))
+    angel = read_wav(sfx_path("angel.wav"))
 
-    # удары по буквам
-    click = _shatter()
-    cn = len(click)
-    for (t, ch) in events:
-        if ch.isspace():
-            continue
-        off = int(t * RATE)
-        for j in range(cn):
-            k = off + j
-            if k >= n:
-                break
-            buf[k] += click[j] / 32767.0 * 1.6
+    buf = array("f", bytes(4 * n))  # нули
+    if len(buf) != n:
+        buf = array("f", [0.0] * n)
 
-    # ангел
-    angel = _angel()
-    off = int(t_angel * RATE)
-    for j in range(min(len(angel), n - off)):
-        buf[off + j] += angel[j] * 1.25
+    # 1) гул, зацикленный до момента ангела, с затуханием перед ним
+    if bed:
+        bn = len(bed)
+        end_bed = int(t_angel * RATE)
+        for i in range(min(n, end_bed)):
+            buf[i] += bed[i % bn] * VOL_BED
+        fade_len = int(0.7 * RATE)
+        start_fade = max(0, end_bed - fade_len)
+        for i in range(start_fade, min(n, end_bed)):
+            buf[i] *= (end_bed - i) / fade_len
 
-    # мягкое ограничение, чтобы не хрипело
-    frames = array("h")
-    for v in buf:
-        if v > 0.92:
-            v = 0.92 - (v - 0.92) * 0.5
-        elif v < -0.92:
-            v = -0.92 - (v + 0.92) * 0.5
-        frames.append(_clip(v, 1.0))
+    # 2) удары по клавишам
+    if keys:
+        rnd = random.Random(777)
+        for (t, ch) in events:
+            if ch.isspace():
+                continue
+            sample = rnd.choice(keys)
+            off = int(t * RATE)
+            sn = len(sample)
+            gain = VOL_KEY * rnd.uniform(0.75, 1.0)
+            for j in range(sn):
+                k = off + j
+                if k >= n:
+                    break
+                buf[k] += sample[j] * gain
+
+    # 3) акцент на точках и многоточиях
+    if accent:
+        for (t, ch) in events:
+            if ch not in ".…":
+                continue
+            off = int(t * RATE)
+            for j in range(len(accent)):
+                k = off + j
+                if k >= n:
+                    break
+                buf[k] += accent[j] * VOL_ACCENT
+
+    # 4) ангел
+    if angel:
+        off = int(t_angel * RATE)
+        for j in range(min(len(angel), n - off)):
+            buf[off + j] += angel[j] * VOL_ANGEL
+
+    # 5) мягкий лимитер и запись
+    pcm = array("h", bytes(2 * n))
+    for i in range(n):
+        v = buf[i]
+        if v > 0.9:
+            v = 0.9 + (v - 0.9) * 0.35
+        elif v < -0.9:
+            v = -0.9 + (v + 0.9) * 0.35
+        if v > 1.0:
+            v = 1.0
+        elif v < -1.0:
+            v = -1.0
+        pcm[i] = int(v * 32767)
 
     path = os.path.join(tempfile.gettempdir(), "anti_alt_f4_screamer.wav")
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(RATE)
-        w.writeframes(frames.tobytes())
-    return path, events, lines, t_end, t_angel
+        w.writeframes(pcm.tobytes())
+
+    log(f"трек собран за {__import__('time').time() - started:.1f}s: "
+        f"{total:.1f}s, событий {len(events)}, ангел на {t_angel:.1f}s")
+    return path, events, lines, t_angel
 
 
 def get_track(log=print):
-    """Готовый трек (при первом вызове синтезируется)."""
-    global _track, _track_path
+    global _track_ready
     with _track_lock:
-        if _track is None:
-            started = time.time()
-            _track_path, events, lines, t_end, t_angel = _build_track()
-            _track = (events, lines, t_end, t_angel)
-            log(f"трек скримера готов за {time.time() - started:.1f}s: {_track_path}")
-        return _track_path, _track
+        if _track_ready is None:
+            _track_ready = compose_track(log)
+        return _track_ready
+
+
+# ---------------------------------------------------------------------------
+# Кадры
+# ---------------------------------------------------------------------------
+_frames_lock = threading.Lock()
+_frames_ready = None  # список PIL.Image
+
+
+def load_frames(log=print):
+    """Читает assets/frames.bin (набор JPEG-кадров) -> список картинок."""
+    global _frames_ready
+    with _frames_lock:
+        if _frames_ready is not None:
+            return _frames_ready
+        path = frames_path()
+        if Image is None or not os.path.exists(path):
+            log(f"кадры скримера не найдены: {path}")
+            _frames_ready = []
+            return _frames_ready
+        with open(path, "rb") as f:
+            blob = f.read()
+        if blob[:4] != b"AAF4":
+            log("frames.bin повреждён")
+            _frames_ready = []
+            return _frames_ready
+        count, w, h = struct.unpack("<HHH", blob[4:10])
+        off = 10
+        out = []
+        import io
+
+        for _ in range(count):
+            ln = struct.unpack("<I", blob[off:off + 4])[0]
+            off += 4
+            out.append(Image.open(io.BytesIO(blob[off:off + ln])).convert("RGB"))
+            off += ln
+        log(f"кадры скримера загружены: {len(out)} шт, {w}x{h}")
+        _frames_ready = out
+        return out
+
+
+def frame_timeline():
+    """Сценарий анимации: (мс от старта, индекс кадра).
+
+    Лицо просто висит, дышит, иногда дёргается и «глитчит» — без криков.
+    """
+    return [
+        (0, 0), (900, 1), (1700, 2), (2500, 3), (3300, 4), (3800, 0),
+        (5200, 5), (5600, 6), (6000, 0), (7400, 7), (7620, 8), (7900, 0),
+        (9500, 1), (10400, 2), (11400, 3), (12400, 4), (12900, 0),
+        (14200, 5), (14800, 6), (15400, 0), (16800, 8), (17100, 0),
+        (18500, 9),
+    ]
 
 
 def warmup(log=print):
-    """Заранее (в фоне) синтезируем звук, чтобы скример стартовал мгновенно."""
+    """Заранее готовим звук и кадры, чтобы скример стартовал мгновенно."""
     def _worker():
         try:
             get_track(log)
         except Exception as e:
-            log(f"warmup failed: {e}")
+            log(f"warmup sound failed: {e}")
+        try:
+            load_frames(log)
+        except Exception as e:
+            log(f"warmup frames failed: {e}")
 
     t = threading.Thread(target=_worker, daemon=True, name="screamer-warmup")
     t.start()
     return t
-
-
-def play_track(path=None, log=print):
-    if os.name != "nt":
-        return
-    try:
-        import winsound
-
-        if path is None:
-            path = get_track(log)[0]
-        winsound.PlaySound(
-            path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT
-        )
-    except Exception as e:
-        log(f"play track error: {e}")
-
-
-def stop_sound(log=print):
-    if os.name != "nt":
-        return
-    try:
-        import winsound
-
-        winsound.PlaySound(None, winsound.SND_PURGE)
-    except Exception as e:
-        log(f"stop sound error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -332,11 +397,10 @@ class SessionMuter:
             self.log(f"pycaw недоступен, чужой звук глушить не смогу: {e}")
 
     def _coinit(self):
-        """В рабочем потоке COM нужно поднять заново, иначе вызовы молча падают."""
         if self._coinit_done or os.name != "nt":
             return
         try:
-            ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # APARTMENTTHREADED
+            ctypes.windll.ole32.CoInitializeEx(None, 0x2)
         except Exception:
             pass
         self._coinit_done = True
@@ -382,14 +446,12 @@ class SessionMuter:
             pid = self._pid(s)
             try:
                 if pid == mypid:
-                    vol.SetMute(False, None)  # свои звуки должны быть слышны
+                    vol.SetMute(False, None)
                     continue
                 key = self._key(s) or f"pid:{pid}"
                 with self._lock:
-                    prev = self._saved.get(key)
-                    if prev is None:
-                        prev = bool(vol.GetMute())
-                        self._saved[key] = prev
+                    if key not in self._saved:
+                        self._saved[key] = bool(vol.GetMute())
                 vol.SetMute(True, None)
                 muted += 1
             except Exception:
@@ -556,68 +618,6 @@ def _become_foreground(win, log=print):
 
 
 # ---------------------------------------------------------------------------
-# Картинка: виньетка + объём
-# ---------------------------------------------------------------------------
-def _vignette_mask(w, h, inner=0.40, power=1.35):
-    """Маска виньетки: 0 в центре, 255 по краям (считаем на малом размере)."""
-    sw = 160
-    sh = max(48, int(sw * h / max(1, w)))
-    small = Image.new("L", (sw, sh), 0)
-    px = small.load()
-    cx, cy = (sw - 1) / 2.0, (sh - 1) / 2.0
-    maxd = math.hypot(cx, cy)
-    for yy in range(sh):
-        for xx in range(sw):
-            d = math.hypot(xx - cx, yy - cy) / maxd
-            v = 0.0 if d < inner else min(1.0, ((d - inner) / (1.0 - inner)) ** power)
-            px[xx, yy] = int(v * 255)
-    return small.resize((w, h), Image.BILINEAR)
-
-
-def make_stage(w, h, path=None, log=print):
-    """Кадр скримера: крупное лицо + тёмные края + подсветка центра (объём)."""
-    path = path or resource_path(SCREAMER_IMAGE)
-    if Image is None or not os.path.exists(path):
-        log(f"картинка скримера не найдена: {path}")
-        return None
-    base = Image.open(path).convert("RGB")
-
-    # 1) подложка: размытая копия на весь экран
-    bg = ImageOps.fit(base, (w, h), method=Image.LANCZOS, centering=(0.5, 0.45))
-    bg = bg.filter(ImageFilter.GaussianBlur(radius=max(8, w // 70)))
-    bg = ImageEnhance.Brightness(bg).enhance(0.45)
-
-    # 2) лицо крупнее экрана — эффект «он прямо перед тобой»
-    face_h = int(h * 1.08)
-    face_w = max(1, int(base.width * face_h / base.height))
-    face = base.resize((face_w, face_h), Image.LANCZOS)
-    canvas = bg.copy()
-    canvas.paste(face, ((w - face_w) // 2, int(-h * 0.035)))
-
-    # 3) виньетка
-    mask = _vignette_mask(w, h, inner=0.40, power=1.45)
-    canvas = Image.composite(Image.new("RGB", (w, h), (0, 0, 0)), canvas, mask)
-
-    # 4) объём: центр чуть ярче и резче, края остаются в темноте
-    center_mask = ImageOps.invert(mask).filter(ImageFilter.GaussianBlur(radius=w // 24))
-    center_mask = center_mask.point(lambda v: int(v * 0.9))
-    lit = ImageEnhance.Brightness(canvas).enhance(1.28)
-    sharp = canvas.filter(ImageFilter.UnsharpMask(radius=4, percent=110, threshold=2))
-    canvas = Image.composite(sharp, canvas, center_mask)
-    canvas = Image.composite(lit, canvas, center_mask.point(lambda v: int(v * 0.55)))
-    return canvas
-
-
-def _zoom(img, w, h, k):
-    """Кадр «дыхания»: лёгкий зум с центрированием."""
-    nw, nh = int(w * k), int(h * k)
-    im = img.resize((nw, nh), Image.BILINEAR)
-    left = max(0, (nw - w) // 2)
-    top = max(0, (nh - h) // 2)
-    return im.crop((left, top, left + w, top + h))
-
-
-# ---------------------------------------------------------------------------
 # Скример
 # ---------------------------------------------------------------------------
 class ScreamerOverlay:
@@ -628,18 +628,11 @@ class ScreamerOverlay:
         self.on_done = on_done
 
         self.win = None
-        self._stage_img = None
-        self._stage_label = None
-        self._text_label = None
-
-        self._base_stage = None
-        self._frames = {}
-        self._frames_ready = False
-        self._lines_done = []
-        self._cur = ""
-        self._phase_i = 0
-        self._cursor_on = True
-        self._size = (1280, 720)
+        self._label = None
+        self._text = None
+        self._photos = {}
+        self._cur_photo = None
+        self._screen = (1280, 720)
         self._finished = False
         self._after_ids = []
 
@@ -664,67 +657,63 @@ class ScreamerOverlay:
         self._after_ids = []
 
     # -- кадры ---------------------------------------------------------------
-    def _prepare_frames(self):
-        """Тяжёлую графику считаем в фоне, чтобы окно не подвисало."""
-        w, h = self._size
-        try:
-            base = make_stage(w, h, log=self.log)
-            if base is None:
-                return
-            self._base_stage = base
-            self._frames["start"] = base
-            self._frames["in"] = _zoom(base, w, h, 1.035)
-            self._frames["out"] = _zoom(base, w, h, 0.985)
-        except Exception as e:
-            self.log(f"stage build error: {e}")
+    def _prepare_photos(self):
+        """JPEG -> PhotoImage под размер экрана (делаем на главном потоке)."""
+        if ImageTk is None:
             return
-        self._frames_ready = True
-        self.log("кадры скримера готовы")
-        self._apply_frame("start")
+        frames = load_frames(self.log)
+        if not frames:
+            return
+        w, h = self._screen
+        for i, img in enumerate(frames):
+            try:
+                fitted = ImageOps.fit(img, (w, h), method=Image.LANCZOS, centering=(0.5, 0.5))
+                self._photos[i] = ImageTk.PhotoImage(fitted)
+            except Exception as e:
+                self.log(f"кадр {i} не подготовлен: {e}")
+        self.log(f"кадры готовы к показу: {len(self._photos)}")
 
-    def _apply_frame(self, phase):
-        if not self._frames_ready or self._stage_label is None:
+    def _show_frame(self, idx):
+        if self._label is None:
             return
-        img = self._frames.get(phase) or self._base_stage
-        if img is None or ImageTk is None:
+        photo = self._photos.get(idx)
+        if photo is None:
             return
+        self._cur_photo = photo
         try:
-            self._stage_img = ImageTk.PhotoImage(img)
-            self._stage_label.config(image=self._stage_img)
+            self._label.config(image=photo, bg="black")
         except Exception as e:
-            self.log(f"frame apply error: {e}")
+            self.log(f"frame show error: {e}")
 
-    def _breathe(self):
+    def _play_timeline(self):
         if self._finished:
             return
-        if self._frames_ready:
-            self._phase_i += 1
-            self._apply_frame("in" if self._phase_i % 2 else "out")
-        self._after(1600, self._breathe)
+        for (ms, idx) in frame_timeline():
+            self._after(ms, lambda i=idx: self._show_frame(i))
 
     # -- окно ---------------------------------------------------------------
     def _build_window(self):
         x, y, w, h = virtual_screen()
-        self._size = (w, h)
+        self._screen = (w, h)
         win = tk.Toplevel(self.root)
         self.win = win
         win.overrideredirect(True)
         win.configure(bg="black", cursor="none")
         win.attributes("-topmost", True)
 
-        self._stage_label = tk.Label(win, bd=0, bg="black")
-        self._stage_label.place(x=0, y=0, width=w, height=h)
+        self._label = tk.Label(win, bd=0, bg="black")
+        self._label.place(x=0, y=0, width=w, height=h)
 
-        self._text_label = tk.Label(
+        self._text = tk.Label(
             win,
             text="",
             bg="black",
-            fg="#ececec",
+            fg="#f2f2f2",
             font=("Consolas", 26, "bold"),
             justify="center",
             wraplength=int(w * 0.70),
         )
-        self._text_label.place(relx=0.5, rely=0.52, anchor="center")
+        self._text.place(relx=0.5, rely=0.53, anchor="center")
 
         win.bind("<Alt-F4>", lambda e: "break")
         win.bind("<Escape>", lambda e: "break")
@@ -765,7 +754,7 @@ class ScreamerOverlay:
         parts = list(self._lines_done)
         parts.append(self._cur + ("█" if self._cursor_on else ""))
         try:
-            self._text_label.config(text="\n".join(parts))
+            self._text.config(text="\n".join(parts))
         except Exception:
             pass
 
@@ -773,40 +762,43 @@ class ScreamerOverlay:
         if self._finished:
             return
         self._cursor_on = not self._cursor_on
-        shades = ["#ececec", "#c9c9c9", "#ffffff", "#a9a9a9", "#ececec", "#f7f7f7"]
+        shades = ["#f2f2f2", "#cfcfcf", "#ffffff", "#a9a9a9", "#f2f2f2", "#fafafa"]
+        self._flash_i = getattr(self, "_flash_i", 0) + 1
         try:
-            self._text_label.config(fg=shades[self._phase_i % len(shades)])
+            self._text.config(fg=shades[self._flash_i % len(shades)])
         except Exception:
             pass
         self._render()
         self._after(340, self._blink)
 
     def _schedule_typing(self, events, lines):
-        """Печать строго по предрассчитанному таймлайну (совпадает со звуком)."""
-        cur = {"i": 0, "text": ""}
+        """Печать строго по тому же таймлайну, по которому собран звук."""
+        state = {"i": 0, "text": ""}
+        self._lines_done = []
+        self._cur = ""
+        self._cursor_on = True
 
         def step():
-            if self._finished or cur["i"] >= len(events):
+            if self._finished or state["i"] >= len(events):
                 return
-            t, ch = events[cur["i"]]
-            cur["i"] += 1
-            cur["text"] += ch
-            self._cur = cur["text"]
+            t, ch = events[state["i"]]
+            state["i"] += 1
+            state["text"] += ch
+            self._cur = state["text"]
             self._cursor_on = True
             self._render()
-            if cur["i"] < len(events):
-                nxt = events[cur["i"]][0]
+            if state["i"] < len(events):
+                nxt = events[state["i"]][0]
                 self._after((nxt - t) * 1000, step)
 
         if events:
             self._after(events[0][0] * 1000, step)
 
         for (start, end, line) in lines:
-            def start_line(start=start):
-                # новая строка печатается с чистого листа
-                cur["text"] = ""
+            def start_line():
+                state["text"] = ""
 
-            def done(line=line, end=end):
+            def done(line=line):
                 if self._finished:
                     return
                 self._lines_done.append(line)
@@ -839,9 +831,9 @@ class ScreamerOverlay:
             return
         color, delay = steps[i]
         try:
-            self._stage_label.config(image="", bg=color)
-            self._stage_img = None
-            self._text_label.config(text="", bg=color)
+            self._label.config(image="", bg=color)
+            self._cur_photo = None
+            self._text.config(text="", bg=color)
             self.win.configure(bg=color)
         except Exception:
             pass
@@ -861,19 +853,20 @@ class ScreamerOverlay:
         self.muter.start()
 
         try:
-            path, (events, lines, t_end, t_angel) = get_track(self.log)
+            path, events, lines, t_angel = get_track(self.log)
         except Exception as e:
             self.log(f"трек не собрался: {e}")
             path, events, lines, t_angel = None, [], [], 8.0
 
         try:
             self._build_window()
+            self._prepare_photos()
+            self._show_frame(0)
             self._render()
-            self._after(400, self._blink)
-            threading.Thread(target=self._prepare_frames, daemon=True, name="stage").start()
-            self._after(700, self._breathe)
-            # звук: гул + печать + ангел одним файлом, ровно по таймлайну
-            play_track(path, log=self.log)
+            self._after(300, self._blink)
+            self._play_timeline()
+            if path:
+                play_file(path, log=self.log)
             self._schedule_typing(events, lines)
             self._after(t_angel * 1000, self._revive)
             self._after(MAX_DURATION_MS, lambda: self._finish("предохранитель"))
@@ -892,7 +885,6 @@ class ScreamerOverlay:
         )
         self._cancel_afters()
         if reason != "возрождение":
-            # ангельский хвост не обрываем, а при сбое — глушим
             try:
                 stop_sound(self.log)
             except Exception:
@@ -908,8 +900,8 @@ class ScreamerOverlay:
         except Exception:
             pass
         self.win = None
-        self._stage_img = None
-        self._frames.clear()
+        self._cur_photo = None
+        self._photos.clear()
         for step in (self.cursor.unlock, self.muter.restore):
             try:
                 step()

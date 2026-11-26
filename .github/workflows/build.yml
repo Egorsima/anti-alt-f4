@@ -35,8 +35,9 @@ jobs:
           python -c "import tkinter; print('tkinter ok')"
           python -c "from pycaw.pycaw import AudioUtilities; print('pycaw ok')"
           python -c "import screamer; print('screamer import ok, lines:', len(screamer.SCREAMER_LINES))"
-          python -c "import screamer; p, t = screamer.get_track(lambda m: None); print('wav:', p, 'events:', len(t[0]), 'angel_at:', round(t[3], 1))"
-          python -c "import screamer; im = screamer.make_stage(1280, 720, log=lambda m: None); print('stage:', im.size if im else 'FAILED')"
+          python -c "import screamer; p, ev, ln, ta = screamer.get_track(lambda m: None); print('wav:', p, 'events:', len(ev), 'angel_at:', round(ta, 1))"
+          python -c "import screamer; fr = screamer.load_frames(lambda m: None); print('frames:', len(fr), fr[0].size if fr else 'FAILED')"
+          python -c "import screamer, os; print('sfx files:', len(os.listdir(screamer.resource_path('assets/sfx'))))"
 
       - name: Check font
         shell: bash
@@ -50,14 +51,15 @@ jobs:
       - name: Build exe
         shell: bash
         run: |
-          DATA="assets/screamer.jpg;assets"
+          DATA="assets/frames.bin;assets"
+          DATA2="assets/sfx;assets/sfx"
           if [ -f icon.ico ]; then
             pyinstaller --onefile --noconsole --name anti-alt-f4 --icon icon.ico \
-              --add-data "$DATA" anti_alt_f4.py
+              --add-data "$DATA" --add-data "$DATA2" anti_alt_f4.py
           else
             echo "icon.ico not found, building without icon"
             pyinstaller --onefile --noconsole --name anti-alt-f4 \
-              --add-data "$DATA" anti_alt_f4.py
+              --add-data "$DATA" --add-data "$DATA2" anti_alt_f4.py
           fi
           ls -la dist/
 

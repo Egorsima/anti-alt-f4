@@ -397,40 +397,28 @@ class AntiAltF4App:
         return "\n".join(lines)
 
     def _play_sound(self, n):
-        """Звук при появлении окна: чем больше попыток, тем злее."""
+        """Звук при появлении окна: реальные сэмплы, 1–9 по нарастающей."""
         if not self.sound_enabled:
             return
         try:
-            import winsound
-        except Exception:
+            from screamer import notify_sound_path, play_file
+        except Exception as e:
+            _log(f"звуки недоступны: {e}")
             return
+
+        n = max(0, min(9, int(n or 0)))
+        if n == 0:
+            path = notify_sound_path(1)
+        else:
+            path = notify_sound_path(n)
 
         def _worker():
             try:
-                if n <= 0:
-                    alias, times = "SystemAsterisk", 1
-                elif n <= 3:
-                    alias, times = "SystemExclamation", 1
-                elif n <= 6:
-                    alias, times = "SystemHand", 1
-                else:
-                    alias, times = "SystemHand", 2
-                for _ in range(times):
-                    try:
-                        winsound.PlaySound(
-                            alias,
-                            winsound.SND_ALIAS
-                            | winsound.SND_ASYNC
-                            | winsound.SND_NODEFAULT,
-                        )
-                    except Exception:
-                        winsound.MessageBeep(winsound.MB_ICONHAND)
-                    if times > 1:
-                        time.sleep(0.35)
+                play_file(path, log=_log)
             except Exception as e:
                 _log(f"sound error: {e}")
 
-        threading.Thread(target=_worker, daemon=True, name="sound").start()
+        threading.Thread(target=_worker, daemon=True, name="notify-sound").start()
 
     def _show_popup(self, text, n):
         # если окно уже открыто — обновить текст/размер и поднять наверх
