@@ -13,7 +13,6 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
 
 # ---------------------------------------------------------------------------
 # Реплики (из README, 1..9; 10-я — скример — пока не используем)
@@ -32,6 +31,43 @@ REPLIKAS = [
 
 APP_NAME = "Anti Alt+F4"
 MAX_ATTEMPTS = len(REPLIKAS)
+
+
+# ---------------------------------------------------------------------------
+# Логирование: в noconsole-сборке sys.stdout/stderr == None, обычный print падает
+# ---------------------------------------------------------------------------
+LOG_PATH = None
+
+
+def _log_path():
+    global LOG_PATH
+    if LOG_PATH:
+        return LOG_PATH
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or os.getcwd()
+    folder = os.path.join(base, "AntiAltF4")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception:
+        folder = os.environ.get("TEMP", ".")
+    LOG_PATH = os.path.join(folder, "app.log")
+    return LOG_PATH
+
+
+def _log(msg):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    try:
+        with open(_log_path(), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    for stream in (sys.stderr, sys.stdout):
+        try:
+            if stream is not None:
+                stream.write(line + "\n")
+                stream.flush()
+        except Exception:
+            pass
+
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +125,7 @@ class AltF4Hook:
         self._user32 = None
         self._kernel32 = None
         self._proc = None
+        self._hook_error = None
 
     @property
     def active(self):
@@ -96,7 +133,7 @@ class AltF4Hook:
 
     def start(self):
         if os.name != "nt":
-            print("[hook] не Windows — хук отключён (только для тестов на Linux)")
+            _log("не Windows — хук отключён")
             return False
         import ctypes
         from ctypes import wintypes
@@ -109,6 +146,38 @@ class AltF4Hook:
         user32 = self._user32
         kernel32 = self._kernel32
 
+        # ВАЖНО: без явных restype/argtypes 64-битные хендлы обрезаются до 32 бит
+        # и SetWindowsHookExW падает -> Alt+F4 перестаёт блокироваться.
+        kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        user32.GetAsyncKeyState.restype = ctypes.c_short
+        user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        user32.CallNextHookEx.restype = ctypes.c_void_p
+        user32.CallNextHookEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        user32.GetMessageW.argtypes = [
+            ctypes.POINTER(wintypes.MSG),
+            ctypes.c_void_p,
+            wintypes.UINT,
+            wintypes.UINT,
+        ]
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
         class KBDLLHOOKSTRUCT(ctypes.Structure):
             _fields_ = [
                 ("vkCode", wintypes.DWORD),
@@ -120,7 +189,7 @@ class AltF4Hook:
 
         self._KBDLLHOOKSTRUCT = KBDLLHOOKSTRUCT
         HOOKPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+            ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
         )
         hook_self = self
 
@@ -137,10 +206,10 @@ class AltF4Hook:
                                 try:
                                     hook_self.on_alt_f4()
                                 except Exception as e:
-                                    print(f"[hook] callback error: {e}", file=sys.stderr)
+                                    _log(f"callback error: {e}")
                             return 1  # проглотить Alt+F4
             except Exception as e:
-                print(f"[hook] proc error: {e}", file=sys.stderr)
+                _log(f"proc error: {e}")
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
         self._proc = HOOKPROC(_proc)
@@ -150,15 +219,21 @@ class AltF4Hook:
             hook = user32.SetWindowsHookExW(
                 hook_self.WH_KEYBOARD_LL, self._proc, hmod, 0
             )
+            if not hook:
+                err = kernel32.GetLastError()
+                _log(f"SetWindowsHookExW failed, GetLastError={err}")
+                hook_self._hook_error = err
+                return
             hook_self._hook = hook
             hook_self._thread_id = kernel32.GetCurrentThreadId()
-            if not hook:
-                print("[hook] SetWindowsHookExW failed", file=sys.stderr)
-                return
             msg = wintypes.MSG()
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            while True:
+                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret <= 0:  # WM_QUIT (0) или ошибка (-1)
+                    break
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
+            _log("hook loop finished")
 
         self._thread = threading.Thread(target=_loop, daemon=True, name="altf4-hook")
         self._thread.start()
@@ -167,7 +242,7 @@ class AltF4Hook:
             if self._hook is not None:
                 break
             time.sleep(0.02)
-        print(f"[hook] active={bool(self._hook)}")
+        _log(f"hook active={bool(self._hook)} err={self._hook_error}")
         return bool(self._hook)
 
     def stop(self):
@@ -208,23 +283,12 @@ class AntiAltF4App:
         # вызывается из потока хука — только кладём в очередь
         self.events.put("alt_f4")
 
-    def _poll_events(self):
-        try:
-            while True:
-                ev = self.events.get_nowait()
-                if ev == "alt_f4":
-                    self._handle_alt_f4()
-        except queue.Empty:
-            pass
-        if not self._exiting:
-            self.root.after(80, self._poll_events)
-
     def _handle_alt_f4(self):
         with self._lock:
             self.attempts += 1
             n = min(self.attempts, MAX_ATTEMPTS)
         text = REPLIKAS[n - 1]
-        print(f"[app] Alt+F4 заблокирован, попытка #{self.attempts}: {text}")
+        _log(f"Alt+F4 заблокирован, попытка #{self.attempts}: {text}")
         self._show_popup(text, n)
 
     # -- окно по центру ------------------------------------------------------
@@ -346,7 +410,7 @@ class AntiAltF4App:
         try:
             import pystray
         except Exception as e:
-            print(f"[tray] pystray недоступен: {e}", file=sys.stderr)
+            _log(f"pystray недоступен: {e}")
             return
 
         image = make_tray_image()
@@ -371,18 +435,24 @@ class AntiAltF4App:
 
         t = threading.Thread(target=self.tray_icon.run, daemon=True, name="tray")
         t.start()
-        # приветствие
-        try:
-            self.tray_icon.notify("Anti Alt+F4 запущен. Alt+F4 заблокирован.", APP_NAME)
-        except Exception:
-            pass
+
+        # приветствие — с задержкой, иначе иконка ещё не успевает появиться в трее
+        def _welcome():
+            time.sleep(2.0)
+            try:
+                self.tray_icon.notify("Anti Alt+F4 запущен. Alt+F4 заблокирован.", APP_NAME)
+                _log("уведомление в трее показано")
+            except Exception as e:
+                _log(f"notify failed: {e}")
+
+        threading.Thread(target=_welcome, daemon=True, name="welcome").start()
 
     # -- выход ---------------------------------------------------------------
     def _exit(self):
         if self._exiting:
             return
         self._exiting = True
-        print("[app] выход")
+        _log("выход")
         try:
             self.hook.stop()
         except Exception:
@@ -407,11 +477,15 @@ class AntiAltF4App:
 
     # -- запуск ---------------------------------------------------------------
     def run(self):
+        _log("старт приложения")
         self._setup_tray()
-        self.hook.start()
+        if not self.hook.start():
+            # вторая попытка: иногда первый SetWindowsHookExW не проходит
+            _log("хук не встал с первого раза, повтор через 0.5s")
+            time.sleep(0.5)
+            if not self.hook.start():
+                _log(f"хук НЕ установлен (err={self.hook._hook_error})")
         # опрос очереди событий в tkinter-потоке (+ обработка show_info/exit)
-        orig_poll = self._poll_events
-
         def poll():
             try:
                 while True:
@@ -435,19 +509,48 @@ class AntiAltF4App:
             self._exit()
 
 
+def _fatal(msg):
+    """Показать ошибку, даже если нет консоли (noconsole-сборка)."""
+    _log(f"FATAL: {msg}")
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                None, msg, APP_NAME, 0x10
+            )
+    except Exception:
+        pass
+
+
 def main():
+    # любые необработанные исключения — в лог, а не молчаливый вылет
+    def _hook_exc(exc_type, exc, tb):
+        import traceback
+
+        _log("unhandled: " + "".join(traceback.format_exception(exc_type, exc, tb)))
+
+    sys.excepthook = _hook_exc
+    threading.excepthook = lambda a: _log(
+        f"thread {getattr(a.thread, 'name', '?')} error: {a.exc_type.__name__}: {a.exc_value}"
+    )
+
     # тестовый режим: показать окно сразу (для проверки без Windows)
     if os.environ.get("ANTI_ALT_F4_TEST") == "1":
         app = AntiAltF4App()
         app.root.after(500, lambda: app._show_popup(REPLIKAS[0], 1))
-        app.root.after(500, lambda: app._show_info())
-        # авто-выход через 3 сек в тесте
         app.root.after(3000, app._exit)
         app.run()
         return
 
-    app = AntiAltF4App()
-    app.run()
+    try:
+        app = AntiAltF4App()
+        app.run()
+    except Exception as e:
+        import traceback
+
+        _fatal(f"Приложение упало:\n{e}\n\nПодробности: {_log_path()}")
+        _log(traceback.format_exc())
 
 
 if __name__ == "__main__":
