@@ -49,6 +49,7 @@ CHAR_DELAY_MIN = 0.045
 CHAR_DELAY_MAX = 0.095
 LINE_PAUSE = 0.95
 HOLD_AFTER_LAST = 1.5
+MAX_DURATION_MS = 90_000  # жёсткий предохранитель: дольше скример не живёт
 
 
 # ---------------------------------------------------------------------------
@@ -288,11 +289,9 @@ class CursorLock:
             r = _RECT(pt.x - 1, pt.y - 1, pt.x + 1, pt.y + 1)
             u.ClipCursor(ctypes.byref(r))
             self.locked = True
-            n = 0
-            while u.ShowCursor(False) >= 0 and n < 64:
-                n += 1
-            self._hidden = n
-            self.log(f"курсор заблокирован и спрятан (ShowCursor x{n})")
+            # курсор не прячем через ShowCursor (глобальный счётчик может «залипнуть»
+            # при аварийном завершении) — окно во весь экран и так без курсора
+            self.log("курсор заблокирован")
         except Exception as e:
             self.log(f"cursor lock failed: {e}")
 
@@ -304,10 +303,6 @@ class CursorLock:
             if self.locked:
                 u.ClipCursor(None)
                 self.locked = False
-            n = 0
-            while u.ShowCursor(True) < 0 and n < 64:
-                n += 1
-            self._hidden = 0
             self.log("курсор освобождён")
         except Exception as e:
             self.log(f"cursor unlock failed: {e}")
@@ -492,16 +487,24 @@ class ScreamerOverlay:
         self.cursor.lock()
         self.muter.start()
 
-        self._build_window()
-        self._render()
-        self._after(400, self._blink)
-        self._after(600, self._type_step)
+        try:
+            self._build_window()
+            self._render()
+            self._after(400, self._blink)
+            self._after(600, self._type_step)
+            # предохранитель: что бы ни случилось, через MAX_DURATION всё вернётся
+            self._after(MAX_DURATION_MS, lambda: self._finish("предохранитель"))
+        except Exception:
+            import traceback
 
-    def _finish(self):
+            self.log("скример упал при показе: " + traceback.format_exc())
+            self._finish("ошибка показа")
+
+    def _finish(self, reason=""):
         if self._finished:
             return
         self._finished = True
-        self.log("скример: конец, возвращаю всё как было")
+        self.log(f"скример: конец{(' (' + reason + ')') if reason else ''}, возвращаю всё как было")
         for aid in self._after_ids:
             try:
                 self.root.after_cancel(aid)
@@ -520,16 +523,20 @@ class ScreamerOverlay:
             pass
         self.win = None
         self._img_ref = None
-        try:
-            self.cursor.unlock()
-        except Exception:
-            pass
-        try:
-            self.muter.restore()
-        except Exception:
-            pass
+        # порядок важен: сначала снять блокировки, потом уведомить приложение
+        for step in (self.cursor.unlock, self.muter.restore):
+            try:
+                step()
+            except Exception as e:
+                self.log(f"restore step failed: {e}")
         try:
             self.set_input_blocked(False)
+        except Exception as e:
+            self.log(f"input unblock failed: {e}")
+        # контрольная проверка курсора
+        try:
+            if os.name == "nt" and ctypes.windll.user32.ClipCursor(None):
+                pass
         except Exception:
             pass
         if self.on_done is not None:
