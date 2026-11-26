@@ -3,6 +3,7 @@ name: Build EXE
 on:
   push:
     branches: ["**"]
+    tags: ["v*"]
   workflow_dispatch:
 
 jobs:
@@ -49,3 +50,39 @@ jobs:
         with:
           name: anti-alt-f4-exe
           path: dist/anti-alt-f4.exe
+
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download exe
+        uses: actions/download-artifact@v4
+        with:
+          name: anti-alt-f4-exe
+
+      - name: Create/update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="v0.1.0-test"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "Release tag: $TAG"
+          ls -la
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release exists, updating asset..."
+            gh release upload "$TAG" anti-alt-f4.exe --clobber
+          else
+            echo "Creating release..."
+            gh release create "$TAG" anti-alt-f4.exe \
+              --title "Anti Alt+F4 $TAG" \
+              --notes "Тестовая версия. Запусти anti-alt-f4.exe — приложение повисит в трее. Нажмёшь Alt+F4 — комбинация заблокируется и по центру появится окно с репликой (1 → 9). Выход: иконка в трее → «Выход»." \
+              --target "${{ github.sha }}"
+          fi
+          gh release view "$TAG"
