@@ -63,7 +63,7 @@ jobs:
         with:
           name: anti-alt-f4-exe
 
-      - name: Create/update release
+      - name: Create release if missing
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -73,16 +73,25 @@ jobs:
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          echo "Release tag: $TAG"
+          echo "TAG=$TAG"
           ls -la
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release exists, updating asset..."
-            gh release upload "$TAG" anti-alt-f4.exe --clobber
+            echo "release exists"
           else
-            echo "Creating release..."
-            gh release create "$TAG" anti-alt-f4.exe \
+            gh release create "$TAG" \
               --title "Anti Alt+F4 $TAG" \
-              --notes "Тестовая версия. Запусти anti-alt-f4.exe — приложение повисит в трее. Нажмёшь Alt+F4 — комбинация заблокируется и по центру появится окно с репликой (1 → 9). Выход: иконка в трее → «Выход»." \
-              --target "${{ github.sha }}"
+              --notes "Тестовая версия. Запусти anti-alt-f4.exe — приложение повисит в трее. Нажмешь Alt+F4 — комбинация заблокируется и по центру появится окно с репликой (1 → 9). Выход: иконка в трее → Выход."
           fi
+
+      - name: Upload exe
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="v0.1.0-test"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          gh release upload "$TAG" anti-alt-f4.exe --clobber
           gh release view "$TAG"
